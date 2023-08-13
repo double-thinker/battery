@@ -71,8 +71,10 @@ Usage:
     eg: battery charge 90
 
   battery discharge LEVEL[1-100]
-    block power input from the adapter until battery falls to this level
+    block power input from the adapter until battery falls to this level. Use --fast to force the use
+    of battery even when plugged in
     eg: battery discharge 90
+    eg: battery discharge 90 --fast
 
   battery visudo
     ensure you don't need to call battery with sudo
@@ -150,6 +152,12 @@ function disable_charging() {
 	sudo smc -k CH0C -w 02
 }
 
+function fast_discharge() {
+	log "Fast discharge mode: the laptop will use the battery even when plugged in"
+	disable_charging
+	enable_discharging
+}
+
 function get_smc_charging_status() {
 	hex_status=$( smc -k CH0B -r | awk '{print $4}' | sed s:\):: )
 	if [[ "$hex_status" == "00" ]]; then
@@ -188,8 +196,8 @@ parse_range() {
 		maintain_percentage_min=$(echo "$1" | cut -d'-' -f 1)
 		maintain_percentage_max=$(echo "$1" | cut -d'-' -f 2)
 	elif [[ "$1" =~ ^[0-9]+$ ]]; then
-		maintain_percentage_min="$1"
-		maintain_percentage_max="$1"
+		maintain_percentage_min=$(echo "$1")
+		maintain_percentage_max=$(echo "$1")
 	else
 		log "Fatal error: Invalid range: $1"
 		exit 1
@@ -353,7 +361,11 @@ if [[ "$action" == "discharge" ]]; then
 	fi
 
 	log "Discharging to $setting% from $battery_percentage%"
-	enable_discharging
+	if [[ "$subsetting" == "--fast" ]]; then
+		fast_discharge
+	else
+		enable_discharging
+	fi
 
 	# Loop until battery percent is exceeded
 	while [[ "$battery_percentage" -gt "$setting" ]]; do
@@ -398,7 +410,7 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 	if [[ "$subsetting" == "--force-discharge" ]]; then
 		# Before we start maintaining the battery level, first discharge to the target level
 		log "Triggering discharge to $maintain_percentage_max before enabling charging limiter"
-		battery discharge "$maintain_percentage_max"
+		battery discharge "$maintain_percentage_max" --fast
 		log "Discharge pre battery-maintenance complete, continuing to battery maintenance loop"
 	else
 		log "Not triggering discharge as it is not requested"
@@ -426,7 +438,6 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 			enable_charging
 
 		elif [[ "$is_charging" == "enabled" ]]; then
-			# It is within range, but charging is enabled. Disable charging.
 			log "Charge between $maintain_percentage_min and $maintain_percentage_max but charging is currently enabled. Disabling charging."
 			disable_charging
 		fi
