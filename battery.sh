@@ -51,10 +51,11 @@ Usage:
     output logs of the battery CLI and GUI
 	eg: battery logs 100
 
-  battery maintain LEVEL[1-100,stop]
+  battery maintain LEVEL[1-100],RANGE[MIN-MAX],stop
     reboot-persistent battery level maintenance: turn off charging above, and on below a certain value
 	it has the option of a --force-discharge flag that discharges even when plugged in (this does NOT work well with clamshell mode)
     eg: battery maintain 80
+    eg: battery maintain 75-80
     eg: battery maintain stop
 
   battery charging SETTING[on/off]
@@ -182,7 +183,19 @@ function get_maintain_percentage() {
 	echo "$maintain_percentage"
 }
 
-
+parse_range() {
+	if [[ "$1" =~ ^[0-9]+-[0-9]+$ ]]; then
+		maintain_percentage_min=$(echo "$1" | cut -d'-' -f 1)
+		maintain_percentage_max=$(echo "$1" | cut -d'-' -f 2)
+	elif [[ "$1" =~ ^[0-9]+$ ]]; then
+		maintain_percentage_min="$1"
+		maintain_percentage_max="$1"
+	else
+		log "Fatal error: Invalid range: $1"
+		exit 1
+	fi
+	echo "$maintain_percentage_min $maintain_percentage_max"
+}
 
 ## ###############
 ## Actions
@@ -294,6 +307,12 @@ fi
 # Charging on/off controller
 if [[ "$action" == "charge" ]]; then
 
+	# if battery level is above target level, do nothing
+	if [[ "$battery_percentage" -ge "$setting" ]]; then
+		log "Battery at $battery_percentage% but charge target is $setting%. Ignoring charge command."
+		exit 0
+	fi
+
 	# Disable running daemon
 	battery maintain stop
 
@@ -326,6 +345,13 @@ if [[ "$action" == "discharge" ]]; then
 
 	# Start charging
 	battery_percentage=$( get_battery_percentage )
+
+	# if battery level is below target level, do nothing
+	if [[ "$battery_percentage" -le "$setting" ]]; then
+		log "Battery at $battery_percentage% but discharge target was $setting%. Ignoring discharge command."
+		exit 0
+	fi
+
 	log "Discharging to $setting% from $battery_percentage%"
 	enable_discharging
 
@@ -352,21 +378,27 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		# Before doing anything, log out environment details as a debugging trail
 		log "Debug trail. User: $USER, config folder: $configfolder, logfile: $logfile, file called with 1: $1, 2: $2"
 
-		maintain_percentage=$( cat $maintain_percentage_tracker_file 2> /dev/null )
-		if [[ $maintain_percentage ]]; then
-			log "Recovering maintenance percentage $maintain_percentage"
-			setting=$( echo $maintain_percentage)
+		args=($( get_maintain_percentage ))
+		setting="${args[0]}"
+		subsetting="${args[1]}"
+
+		if [[ $setting ]]; then
+			log "Recovering maintenance settings $setting $subsetting"
 		else
 			log "No setting to recover, exiting"
 			exit 0
 		fi
 	fi
 
+	range=($(parse_range "$setting"))
+	maintain_percentage_min="${range[0]}"
+	maintain_percentage_max="${range[1]}"
+
 	# Check if the user requested that the battery maintenance first discharge to the desired level
 	if [[ "$subsetting" == "--force-discharge" ]]; then
 		# Before we start maintaining the battery level, first discharge to the target level
-		log "Triggering discharge to $setting before enabling charging limiter"
-		battery discharge "$setting"
+		log "Triggering discharge to $maintain_percentage_max before enabling charging limiter"
+		battery discharge "$maintain_percentage_max"
 		log "Discharge pre battery-maintenance complete, continuing to battery maintenance loop"
 	else
 		log "Not triggering discharge as it is not requested"
@@ -383,16 +415,20 @@ if [[ "$action" == "maintain_synchronous" ]]; then
 		# Keep track of status
 		is_charging=$( get_smc_charging_status )
 
-		if [[ "$battery_percentage" -ge "$setting" && "$is_charging" == "enabled" ]]; then
+		if [[ "$battery_percentage" -ge "$maintain_percentage_max" && "$is_charging" == "enabled" ]]; then
 
 			log "Charge above $setting"
 			disable_charging
 
-		elif [[ "$battery_percentage" -lt "$setting" && "$is_charging" == "disabled" ]]; then
+		elif [[ "$battery_percentage" -lt "$maintain_percentage_min" && "$is_charging" == "disabled" ]]; then
 
 			log "Charge below $setting"
 			enable_charging
 
+		elif [[ "$is_charging" == "enabled" ]]; then
+			# It is within range, but charging is enabled. Disable charging.
+			log "Charge between $maintain_percentage_min and $maintain_percentage_max but charging is currently enabled. Disabling charging."
+			disable_charging
 		fi
 
 		sleep 60
@@ -407,6 +443,22 @@ fi
 
 # Asynchronous battery level maintenance
 if [[ "$action" == "maintain" ]]; then
+
+	# Check if setting is value between 0 and 100 or a interval like "40-60" or "stop" or "recover"
+	log "Called $action with $setting $subsetting"
+	if [[ "$setting" =~ ^[0-9]+$ ]] || [[ "$setting" =~ ^[0-9]+-[0-9]+$ ]]; then
+		# check if numbers are in range
+		range=($(parse_range "$setting"))
+		maintain_percentage_min="${range[0]}"
+		maintain_percentage_max="${range[1]}"
+		if [[ "$maintain_percentage_min" -lt 0 ]] || [[ "$maintain_percentage_min" -gt 100 ]] || [[ "$maintain_percentage_max" -lt 0 ]] || [[ "$maintain_percentage_max" -gt 100 ]]; then
+			log "Error: $setting is not a valid setting for battery maintain. The specified battery level or range must be between 0 and 100."
+			exit 1
+		fi
+	elif ! [[ "$setting" == "stop" ]] && ! [[ "$setting" == "recover" ]]; then
+		log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, a range like 50-60, or an action keyword like 'stop' or 'recover'."
+		exit 1
+	fi
 
 	# Kill old process silently
 	if test -f "$pidfile"; then
@@ -424,18 +476,6 @@ if [[ "$action" == "maintain" ]]; then
 		exit 0
 	fi
 
-	# Check if setting is value between 0 and 100
-	if ! [[ "$setting" =~ ^[0-9]+$ ]] || [[ "$setting" -lt 0 ]] || [[ "$setting" -gt 100 ]]; then
-
-		log "Called with $setting $action"
-		# If non 0-100 setting is not a special keyword, exit with an error.
-		if ! { [[ "$setting" == "stop" ]] || [[ "$setting" == "recover" ]]; }; then
-			log "Error: $setting is not a valid setting for battery maintain. Please use a number between 0 and 100, or an action keyword like 'stop' or 'recover'."
-			exit 1
-		fi
-
-	fi
-
 	# Start maintenance script
 	log "Starting battery maintenance at $setting% $subsetting"
 	nohup battery maintain_synchronous $setting $subsetting >> $logfile &
@@ -446,7 +486,7 @@ if [[ "$action" == "maintain" ]]; then
 
 	if ! [[ "$setting" == "recover" ]]; then
 		log "Writing new setting $setting to $maintain_percentage_tracker_file"
-		echo $setting > $maintain_percentage_tracker_file
+		echo "$setting $subsetting" > $maintain_percentage_tracker_file
 		log "Maintaining battery at $setting%"
 	fi
 
@@ -463,7 +503,7 @@ if [[ "$action" == "status" ]]; then
 
 	log "Battery at $( get_battery_percentage  )% ($( get_remaining_time ) remaining), smc charging $( get_smc_charging_status )"
 	if test -f $pidfile; then
-		maintain_percentage=$( cat $maintain_percentage_tracker_file 2> /dev/null )
+		maintain_percentage=$( get_maintain_percentage )
 		log "Your battery is currently being maintained at $maintain_percentage%"
 	fi
 	exit 0
